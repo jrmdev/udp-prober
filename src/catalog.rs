@@ -9,6 +9,7 @@ pub struct ProbeDef {
     pub display_name: &'static str,
     pub aliases: Vec<String>,
     pub ports: Vec<u16>,
+    pub source_port: Option<u16>,
     pub payload: Arc<[u8]>,
     pub payload_hex: &'static str,
     pub rarity: u8,
@@ -21,6 +22,7 @@ pub struct SelectedProbe {
     pub canonical: String,
     pub display_name: &'static str,
     pub port: u16,
+    pub source_port: Option<u16>,
     pub payload: Arc<[u8]>,
     pub payload_len: usize,
 }
@@ -79,6 +81,7 @@ pub fn select_probes(
                         canonical: definition.canonical.clone(),
                         display_name: definition.display_name,
                         port,
+                        source_port: definition.source_port,
                         payload: definition.payload.clone(),
                         payload_len: definition.payload.len(),
                     },
@@ -105,6 +108,7 @@ pub fn select_probes(
                     canonical: definition.canonical.clone(),
                     display_name: definition.display_name,
                     port,
+                    source_port: definition.source_port,
                     payload: definition.payload.clone(),
                     payload_len: definition.payload.len(),
                 },
@@ -124,6 +128,7 @@ pub fn select_probes(
                         canonical: definition.canonical.clone(),
                         display_name: definition.display_name,
                         port,
+                        source_port: definition.source_port,
                         payload: definition.payload.clone(),
                         payload_len: definition.payload.len(),
                     },
@@ -197,6 +202,7 @@ fn build_definitions() -> Vec<ProbeDef> {
                 display_name: template.display_name,
                 aliases: aliases.into_iter().collect(),
                 ports: expand_port_list(template.ports),
+                source_port: preferred_source_port(template.display_name),
                 payload: Arc::from(
                     hex::decode(template.payload_hex)
                         .unwrap_or_else(|error| panic!("invalid hex payload: {error}")),
@@ -267,6 +273,13 @@ fn canonicalize_name(name: &str) -> String {
     words.join("-")
 }
 
+fn preferred_source_port(display_name: &str) -> Option<u16> {
+    match display_name {
+        "ike" => Some(500),
+        _ => None,
+    }
+}
+
 fn templates() -> Vec<ProbeTemplate> {
     vec![
         ProbeTemplate {
@@ -274,7 +287,19 @@ fn templates() -> Vec<ProbeTemplate> {
             canonical_override: None,
             extra_aliases: &[],
             ports: "500",
-            payload_hex: "5b5e64c03e99b51100000000000000000110020000000000000001500000013400000001000000010000012801010008030000240101",
+            payload_hex: concat!(
+                "1b90727d0f626e07000000000000000001100200000000000000015000000134",
+                "0000000100000001000001280101000803000024010100008001000580020002",
+                "8003000180040002800b0001000c000400007080030000240201000080010005",
+                "800200018003000180040002800b0001000c0004000070800300002403010000",
+                "80010001800200028003000180040002800b0001000c00040000708003000024",
+                "0401000080010001800200018003000180040002800b0001000c000400007080",
+                "030000240501000080010005800200028003000180040001800b0001000c0004",
+                "00007080030000240601000080010005800200018003000180040001800b0001",
+                "000c000400007080030000240701000080010001800200028003000180040001",
+                "800b0001000c0004000070800000002408010000800100018002000180030001",
+                "80040001800b0001000c000400007080"
+            ),
             rarity: 1,
             default_enabled: true,
             safety_note: None,
@@ -1104,5 +1129,15 @@ mod tests {
             probe.safety_note,
             Some("Unauthenticated packet-auth OpenVPN listeners may stay silent.")
         );
+    }
+
+    #[test]
+    fn ike_probe_prefers_udp_source_port_500() {
+        let probe = find_probe_definition("ike").unwrap();
+        assert_eq!(probe.ports, vec![500]);
+        assert_eq!(probe.source_port, Some(500));
+        assert_eq!(probe.payload.len(), 336);
+        assert_eq!(probe.payload_hex.len(), 672);
+        assert!(probe.payload_hex.starts_with("1b90727d0f626e07"));
     }
 }

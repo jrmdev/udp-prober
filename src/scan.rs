@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -114,7 +114,23 @@ pub fn run_scan(config: ScanConfig, events: Sender<ScanEvent>) -> Result<ScanSum
     }
 
     let start = Instant::now();
-    let threads = config.threads.max(1);
+    let requested_threads = config.threads.max(1);
+    let fixed_source_port_probes = probes_requiring_fixed_source_ports(&config.selected_probes);
+    let mut preflight_warnings = 0u64;
+    let threads = if fixed_source_port_probes.is_empty() {
+        requested_threads
+    } else {
+        1
+    };
+    if threads != requested_threads {
+        let probe_list = fixed_source_port_probes.join(", ");
+        let _ = events.send(ScanEvent::Warning(WarningEvent {
+            message: format!(
+                "forcing --threads=1 because probe(s) {probe_list} require a fixed UDP source port"
+            ),
+        }));
+        preflight_warnings += 1;
+    }
     let target_channel_capacity =
         (MAX_INFLIGHT_STATES_PER_WORKER / config.selected_probes.len().max(1)).max(1);
 
@@ -153,6 +169,7 @@ pub fn run_scan(config: ScanConfig, events: Sender<ScanEvent>) -> Result<ScanSum
     let mut summary = ScanSummary {
         targets_scanned: dispatcher_stats.targets_scanned,
         probes_selected: config.selected_probes.len(),
+        warnings: preflight_warnings,
         ..ScanSummary::default()
     };
 
@@ -205,8 +222,9 @@ fn run_worker(
 ) -> Result<WorkerStats> {
     let mut poll = Poll::new().context("failed to create poll instance")?;
     let mut sockets = Vec::with_capacity(config.selected_probes.len());
-    for (probe_index, _) in config.selected_probes.iter().enumerate() {
-        let mut ipv4_socket = new_udp_socket(SocketFamily::V4)?;
+    let mut pending_warnings = Vec::new();
+    for (probe_index, probe) in config.selected_probes.iter().enumerate() {
+        let (mut ipv4_socket, ipv4_warning) = new_udp_socket(SocketFamily::V4, probe.source_port)?;
         poll.registry()
             .register(
                 &mut ipv4_socket,
@@ -214,7 +232,15 @@ fn run_worker(
                 Interest::READABLE,
             )
             .context("failed to register IPv4 UDP socket with poll")?;
-        let mut ipv6_socket = new_udp_socket(SocketFamily::V6)?;
+        if let Some(error) = ipv4_warning {
+            pending_warnings.push(format!(
+                "probe {} requested UDP source port {} on {} but bind failed ({error}); falling back to an ephemeral source port, which may miss some responders",
+                probe.canonical,
+                probe.source_port.unwrap(),
+                socket_family_label(SocketFamily::V4),
+            ));
+        }
+        let (mut ipv6_socket, ipv6_warning) = new_udp_socket(SocketFamily::V6, probe.source_port)?;
         poll.registry()
             .register(
                 &mut ipv6_socket,
@@ -222,6 +248,14 @@ fn run_worker(
                 Interest::READABLE,
             )
             .context("failed to register UDP socket with poll")?;
+        if let Some(error) = ipv6_warning {
+            pending_warnings.push(format!(
+                "probe {} requested UDP source port {} on {} but bind failed ({error}); falling back to an ephemeral source port, which may miss some responders",
+                probe.canonical,
+                probe.source_port.unwrap(),
+                socket_family_label(SocketFamily::V6),
+            ));
+        }
         sockets.push(ProbeSockets {
             ipv4: ipv4_socket,
             ipv6: ipv6_socket,
@@ -242,6 +276,9 @@ fn run_worker(
         input_closed: false,
         stats: WorkerStats::default(),
     };
+    for warning in pending_warnings {
+        emit_warning(&mut context, warning);
+    }
 
     let mut events = Events::with_capacity(1024);
     loop {
@@ -264,7 +301,10 @@ fn run_worker(
     Ok(context.stats)
 }
 
-fn new_udp_socket(family: SocketFamily) -> Result<UdpSocket> {
+fn new_udp_socket(
+    family: SocketFamily,
+    preferred_source_port: Option<u16>,
+) -> Result<(UdpSocket, Option<io::Error>)> {
     let domain = match family {
         SocketFamily::V4 => Domain::IPV4,
         SocketFamily::V6 => Domain::IPV6,
@@ -276,20 +316,23 @@ fn new_udp_socket(family: SocketFamily) -> Result<UdpSocket> {
     match family {
         SocketFamily::V4 => {
             socket.set_broadcast(true)?;
-            socket.bind(&SockAddr::from(SocketAddr::from((
-                Ipv4Addr::UNSPECIFIED,
-                0,
-            ))))?;
         }
         SocketFamily::V6 => {
             socket.set_only_v6(true)?;
-            socket.bind(&SockAddr::from(SocketAddr::from((
-                Ipv6Addr::UNSPECIFIED,
-                0,
-            ))))?;
         }
     }
-    Ok(UdpSocket::from_std(socket.into()))
+
+    let mut bind_warning = None;
+    if let Some(port) = preferred_source_port {
+        if let Err(error) = socket.bind(&SockAddr::from(bind_addr_for_family(family, port))) {
+            bind_warning = Some(error);
+            socket.bind(&SockAddr::from(bind_addr_for_family(family, 0)))?;
+        }
+    } else {
+        socket.bind(&SockAddr::from(bind_addr_for_family(family, 0)))?;
+    }
+
+    Ok((UdpSocket::from_std(socket.into()), bind_warning))
 }
 
 fn fill_targets(context: &mut WorkerContext, block_when_empty: bool) -> Result<()> {
@@ -636,10 +679,37 @@ fn socket_for_target(sockets: &mut ProbeSockets, target_ip: IpAddr) -> &mut UdpS
     }
 }
 
+fn bind_addr_for_family(family: SocketFamily, port: u16) -> SocketAddr {
+    match family {
+        SocketFamily::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        SocketFamily::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+    }
+}
+
 fn packet_overhead_bytes(target_ip: IpAddr) -> usize {
     match target_ip {
         IpAddr::V4(_) => IPV4_PACKET_OVERHEAD_BYTES,
         IpAddr::V6(_) => IPV6_PACKET_OVERHEAD_BYTES,
+    }
+}
+
+fn probes_requiring_fixed_source_ports(selected_probes: &[SelectedProbe]) -> Vec<String> {
+    selected_probes
+        .iter()
+        .filter_map(|probe| {
+            probe
+                .source_port
+                .map(|port| format!("{}({port})", probe.canonical))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn socket_family_label(family: SocketFamily) -> &'static str {
+    match family {
+        SocketFamily::V4 => "IPv4",
+        SocketFamily::V6 => "IPv6",
     }
 }
 
@@ -662,12 +732,14 @@ mod tests {
     enum ResponseMode {
         Always(Vec<u8>),
         After(usize, Vec<u8>),
+        WhenSourcePort(u16, Vec<u8>),
     }
 
     struct TestServer {
         port: u16,
         wake_addr: SocketAddr,
         received_at: Arc<Mutex<Vec<Instant>>>,
+        received_from: Arc<Mutex<Vec<SocketAddr>>>,
         shutdown_tx: crossbeam_channel::Sender<()>,
         handle: Option<thread::JoinHandle<()>>,
     }
@@ -693,6 +765,8 @@ mod tests {
             };
             let received_at = Arc::new(Mutex::new(Vec::new()));
             let received_clone = Arc::clone(&received_at);
+            let received_from = Arc::new(Mutex::new(Vec::new()));
+            let received_from_clone = Arc::clone(&received_from);
             let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
             let handle = thread::spawn(move || {
@@ -707,10 +781,14 @@ mod tests {
                         Ok((_size, source)) => {
                             packets_seen += 1;
                             received_clone.lock().unwrap().push(Instant::now());
+                            received_from_clone.lock().unwrap().push(source);
                             let reply = match &mode {
                                 ResponseMode::Always(payload) => Some(payload.as_slice()),
                                 ResponseMode::After(after, payload) => {
                                     (packets_seen >= *after).then_some(payload.as_slice())
+                                }
+                                ResponseMode::WhenSourcePort(port, payload) => {
+                                    (source.port() == *port).then_some(payload.as_slice())
                                 }
                             };
                             if let Some(reply) = reply {
@@ -731,6 +809,7 @@ mod tests {
                 port,
                 wake_addr,
                 received_at,
+                received_from,
                 shutdown_tx,
                 handle: Some(handle),
             })
@@ -742,6 +821,15 @@ mod tests {
 
         fn received_times(&self) -> Vec<Instant> {
             self.received_at.lock().unwrap().clone()
+        }
+
+        fn received_source_ports(&self) -> Vec<u16> {
+            self.received_from
+                .lock()
+                .unwrap()
+                .iter()
+                .map(SocketAddr::port)
+                .collect()
         }
     }
 
@@ -761,10 +849,20 @@ mod tests {
     }
 
     fn probe(name: &str, port: u16, payload: &[u8]) -> SelectedProbe {
+        probe_with_source_port(name, port, None, payload)
+    }
+
+    fn probe_with_source_port(
+        name: &str,
+        port: u16,
+        source_port: Option<u16>,
+        payload: &[u8],
+    ) -> SelectedProbe {
         SelectedProbe {
             canonical: name.to_string(),
             display_name: Box::leak(name.to_string().into_boxed_str()),
             port,
+            source_port,
             payload: Arc::<[u8]>::from(payload.to_vec()),
             payload_len: payload.len(),
         }
@@ -941,5 +1039,76 @@ mod tests {
                 .iter()
                 .any(|ip| *ip == "::1".parse::<IpAddr>().unwrap())
         );
+    }
+
+    #[test]
+    fn scan_can_bind_a_probe_to_a_specific_source_port() {
+        let reserved_source = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let source_port = reserved_source.local_addr().unwrap().port();
+        drop(reserved_source);
+
+        let server = TestServer::start(ResponseMode::Always(b"ike".to_vec()));
+
+        let (summary, events) = run_test_scan(
+            vec![probe_with_source_port(
+                "ike",
+                server.port,
+                Some(source_port),
+                &[0x01, 0x02],
+            )],
+            vec![
+                "127.0.0.1".into(),
+                "127.0.0.2".into(),
+                "127.0.0.3".into(),
+                "127.0.0.4".into(),
+            ],
+            0,
+            20,
+            None,
+            4,
+            Duration::from_millis(150),
+        );
+
+        assert_eq!(summary.hits, 1);
+        assert_eq!(summary.warnings, 1);
+        assert_eq!(server.received_source_ports(), vec![source_port; 4]);
+        assert!(events.iter().any(|event| {
+            matches!(event, ScanEvent::Warning(warning)
+                if warning.message.contains("forcing --threads=1"))
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event, ScanEvent::Hit(hit) if hit.probe == "ike") })
+        );
+    }
+
+    #[test]
+    fn scan_warns_and_falls_back_when_fixed_source_port_is_unavailable() {
+        let reserved_source = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let source_port = reserved_source.local_addr().unwrap().port();
+        let server = TestServer::start(ResponseMode::WhenSourcePort(source_port, b"ike".to_vec()));
+
+        let (summary, events) = run_test_scan(
+            vec![probe_with_source_port(
+                "ike",
+                server.port,
+                Some(source_port),
+                &[0x01, 0x02],
+            )],
+            vec!["127.0.0.1".into()],
+            0,
+            20,
+            None,
+            1,
+            Duration::from_millis(150),
+        );
+
+        assert_eq!(summary.hits, 0);
+        assert!(summary.warnings >= 1);
+        assert!(events.iter().any(|event| {
+            matches!(event, ScanEvent::Warning(warning)
+                if warning.message.contains("falling back to an ephemeral source port"))
+        }));
     }
 }
